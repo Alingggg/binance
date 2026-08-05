@@ -196,11 +196,11 @@ open_price
 high_price
 low_price
 close_price
-base_asset_volume
+volume
 quote_asset_volume
-trade_count
-taker_buy_base_volume
-taker_buy_quote_volume
+number_of_trades
+taker_buy_base_asset_volume
+taker_buy_quote_asset_volume
 source_run_id
 loaded_at
 ```
@@ -263,7 +263,7 @@ Fail the DAG when an important rule is violated:
 - `high_price` is not lower than open or close.
 - `low_price` is not higher than open or close.
 - Prices and volumes are not negative.
-- `trade_count` is not negative.
+- `number_of_trades` is not negative.
 - No duplicate silver unique keys exist.
 
 ## Suggested project structure
