@@ -26,7 +26,7 @@ The completed project should demonstrate the following concepts:
 - Idempotent upserts for overlapping source data
 - pandas-based validation and transformation
 - SQL time-window aggregation
-- Unit, integration, and DAG testing
+- Manual validation of Python functions, database writes, and DAG runs
 - The distinction between live polling and historical backfills
 
 ## 3. Initial scope
@@ -55,7 +55,6 @@ Additional symbols, historical extraction, dashboards, streaming, Spark, and tab
 - pandas for response validation and transformation
 - PostgreSQL for bronze, silver, and gold data
 - `psycopg` for database access
-- `pytest` for automated tests
 
 The custom Airflow image should extend the same Airflow version used by Docker Compose and install dependencies from `pyproject.toml`. Rebuild the image whenever runtime dependencies change.
 
@@ -65,12 +64,6 @@ Required runtime dependencies:
 pandas
 psycopg[binary]
 requests
-```
-
-Required development dependency:
-
-```text
-pytest
 ```
 
 The `psycopg` package is sufficient for ordinary Python database functions. Add `apache-airflow-providers-postgres` only if the implementation uses Airflow's `PostgresHook` or PostgreSQL-specific operators.
@@ -371,20 +364,12 @@ airflow-project/
 │           ├── __init__.py
 │           ├── extract.py
 │           ├── transform.py
-│           ├── load.py
 │           └── validate.py
 ├── sql/
 │   └── init/
 │       ├── 001_create_bronze_binance_api_runs.sql
 │       ├── 002_create_silver_crypto_klines.sql
 │       └── 003_create_gold_crypto_aggregates.sql
-├── tests/
-│   ├── fixtures/
-│   │   └── binance_klines_response.json
-│   ├── test_extract.py
-│   ├── test_transform.py
-│   ├── test_load.py
-│   └── test_dag.py
 ├── docker-compose.yaml
 ├── Dockerfile
 ├── pyproject.toml
@@ -393,7 +378,15 @@ airflow-project/
 
 Keep the DAG file limited to orchestration concerns: configuration, task definitions, dependencies, retry policy, and scheduling. Place reusable extraction, transformation, loading, and validation logic under `src/airflow_project/binance/`.
 
-All non-Airflow functions should be directly importable and testable without starting the scheduler.
+All non-Airflow functions should be directly importable and runnable without starting the scheduler. This allows them to be checked manually from a notebook or a small Python script before the DAG is created.
+
+The file names describe the main responsibility of each module:
+
+- `extract.py` requests and validates the Binance response, then inserts it into bronze.
+- `transform.py` reads the bronze payload, converts it into typed records, then upserts them into silver.
+- `validate.py` contains reusable data-quality checks.
+
+Loading simply means writing data to a destination. This pipeline loads twice: the raw response is loaded into bronze, then the transformed records are loaded into silver. There is no need for a separate `load.py` or a separate `load` task at this project size. Use the two task names `extract_and_load_bronze` and `transform_and_load_silver` so both database writes are explicit.
 
 ## 11. Implementation phases
 
@@ -411,24 +404,24 @@ All non-Airflow functions should be directly importable and testable without sta
 - Inspect the array-based response.
 - Confirm UTC timestamp conversion.
 - Confirm decimal conversion of price and volume fields.
-- Save one representative response as a test fixture.
+- Save or inspect one representative response for repeatable manual checks.
 
 ### Phase 3 — Create the data model
 
 - Create bronze and silver tables.
 - Create the initial five-minute gold view.
-- Insert a fixture into bronze manually.
+- Insert a representative response into bronze manually.
 - Transform and upsert it into silver.
 - Query silver chronologically and inspect the gold result.
 
-### Phase 4 — Implement testable Python functions
+### Phase 4 — Implement reusable Python functions
 
 - Implement API extraction and validation.
 - Implement bronze insertion.
 - Implement payload transformation.
 - Implement silver upsert logic.
 - Implement data-quality functions.
-- Run unit and database integration tests before creating the DAG.
+- Run the functions manually and inspect their database results before creating the DAG.
 
 ### Phase 5 — Build the DAG
 
@@ -447,39 +440,27 @@ All non-Airflow functions should be directly importable and testable without sta
 - Retry and clear tasks to observe retry behavior.
 - Confirm that failures produce useful logs and quality-check messages.
 
-## 12. Testing requirements
+## 12. Manual validation checklist
 
-### 12.1 Unit tests
+Before moving the functions into the DAG:
 
-- Mock the Binance HTTP request.
-- Test a valid response.
-- Test an empty response.
-- Test an API error object.
-- Test a malformed candle with fewer or more than 12 positions.
-- Test timestamp conversion and UTC awareness.
-- Test decimal conversion.
-- Test `is_closed` for open and closed candles.
-- Test expected DataFrame columns and null handling.
-
-### 12.2 Database integration tests
-
-- Insert a known bronze fixture.
-- Transform and load it into silver.
-- Reprocess the same candles and confirm that row counts do not increase.
-- Modify one candle and confirm that the upsert updates it.
-- Confirm that `source_extraction_id` changes to the latest extraction.
-- Confirm that database constraints reject invalid values.
-- Compare one gold window with a manually calculated result.
+- Run the Binance request and confirm it returns a non-empty list of 12-position candles.
+- Run the bronze insert and query the row by `extraction_id`.
+- Run the transformation and inspect the column names, UTC timestamps, decimal values, and `is_closed` result.
+- Run the silver upsert and query the affected candles in chronological order.
+- Reprocess overlapping candles and confirm the silver row count does not grow for existing primary keys.
+- Confirm that an updated candle changes values and `source_extraction_id`.
+- Query the gold view and manually compare one complete five-minute window.
 - Confirm that unfinished candles and incomplete five-minute windows are excluded from gold.
 
-### 12.3 Airflow tests
+After creating the DAG:
 
 - Confirm that Airflow parses the DAG without import errors.
-- Confirm the expected task IDs and dependencies.
-- Run tasks individually during development.
+- Confirm the expected task IDs and dependencies in the Airflow UI.
+- Run each task individually during development.
 - Trigger a full manual DAG run.
-- Confirm that XCom stores the extraction identifier rather than the payload or DataFrame.
-- Retry or clear a task and confirm silver idempotency.
+- Confirm that XCom stores only the extraction identifier, not the payload or DataFrame.
+- Retry or clear a task and confirm the silver upsert remains idempotent.
 
 ## 13. Live polling and historical backfills
 
@@ -524,6 +505,6 @@ The initial project is complete when all of the following conditions are satisfi
 - The five-minute gold view uses ordered open and close values.
 - Unfinished candles and incomplete five-minute windows are excluded from the initial gold results.
 - Invalid data causes a clear quality-check failure.
-- Extraction, transformation, and loading logic have automated tests.
+- Extraction, transformation, and loading logic pass the manual validation checklist.
 - The DAG parses successfully and completes a manual end-to-end run.
 - Several scheduled runs complete without violating database constraints or silver uniqueness.
