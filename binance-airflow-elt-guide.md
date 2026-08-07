@@ -1,191 +1,200 @@
-# Binance Airflow ELT Practice Project
+# Binance Market Data ELT Pipeline with Apache Airflow
 
-## Project goal
+## 1. Project objective
 
-Build a cryptocurrency market-data pipeline that uses Apache Airflow to:
+Build a scheduled batch pipeline that retrieves Binance Spot candlestick data, preserves each raw API response in PostgreSQL, transforms the response into typed OHLCV records, and exposes time-windowed price summaries for analysis.
 
-1. **Extract** recent candlestick data from the Binance Spot API.
-2. **Load** the raw API response into PostgreSQL.
-3. **Transform** it into clean, queryable OHLCV records.
-4. Produce your own time-based aggregations to observe price changes.
+The project follows an ELT design:
 
-This is an **ELT** project because the raw response is stored before it is transformed.
+1. **Extract** recent candlestick data from the Binance Spot REST API.
+2. **Load** the complete response into a bronze PostgreSQL table.
+3. **Transform** the stored response into validated silver records.
+4. **Expose** gold-level time-windowed aggregations through SQL.
+5. **Validate** the resulting data before completing the DAG run.
 
-## Initial scope
+The initial implementation is intended for local learning and development. It is not a production deployment design.
 
-Start with these settings:
+## 2. Learning objectives
 
-- Trading pair: `BTCUSDT`
-- Binance candle interval: `1m`
-- Airflow schedule: every 5 minutes
-- Candles requested per run: 10
-- Database: PostgreSQL
+The completed project should demonstrate the following concepts:
 
-Each DAG run retrieves the most recent ten one-minute candles. Consecutive requests overlap, which lets you practice upserts and idempotency.
+- Airflow DAG structure, schedules, task dependencies, retries, and logs
+- Docker Compose service discovery and container networking
+- Airflow Connections for database credentials
+- PostgreSQL `JSONB`, constraints, indexes, and transactions
+- Bronze, silver, and gold data modeling
+- Idempotent upserts for overlapping source data
+- pandas-based validation and transformation
+- SQL time-window aggregation
+- Unit, integration, and DAG testing
+- The distinction between live polling and historical backfills
 
-After the BTC pipeline works, you can add other pairs such as `ETHUSDT` and `BNBUSDT`.
+## 3. Initial scope
 
-## Suggested tools
+Use the following settings for the first working version:
+
+| Setting | Value |
+| --- | --- |
+| Trading pair | `BTCUSDT` |
+| Binance candle interval | `1m` |
+| Airflow schedule | Every five minutes |
+| Candles requested per run | 10 |
+| Time zone | UTC |
+| Warehouse | PostgreSQL |
+
+Each scheduled run retrieves the latest ten one-minute candles. Consecutive requests intentionally overlap. The overlap is required to practice unique keys, upserts, retry safety, and updates to an unfinished candle.
+
+Additional symbols, historical extraction, dashboards, streaming, Spark, and table partitioning are outside the initial scope.
+
+## 4. Technology stack
 
 - Apache Airflow for orchestration
-- Python and `requests` for extraction
-- PostgreSQL for bronze, silver, and gold tables
-- pandas for flattening and cleaning the API response
-- SQL for aggregations
-- `pytest` for testing Python code
-- Docker Compose for the local environment
+- Airflow's official Docker Compose quick-start with `CeleryExecutor`
+- A custom Airflow image for installing project dependencies
+- Python and `requests` for HTTP extraction
+- pandas for response validation and transformation
+- PostgreSQL for bronze, silver, and gold data
+- `psycopg` for database access
+- `pytest` for automated tests
 
-Spark is unnecessary for the initial project because each request contains very little data. Use it later in a separate exercise with a much larger historical dataset.
+The custom Airflow image should extend the same Airflow version used by Docker Compose and install dependencies from `pyproject.toml`. Rebuild the image whenever runtime dependencies change.
 
-## Binance API request
+Required runtime dependencies:
+
+```text
+pandas
+psycopg[binary]
+requests
+```
+
+Required development dependency:
+
+```text
+pytest
+```
+
+The `psycopg` package is sufficient for ordinary Python database functions. Add `apache-airflow-providers-postgres` only if the implementation uses Airflow's `PostgresHook` or PostgreSQL-specific operators.
+
+## 5. Local service architecture
+
+Use separate PostgreSQL services for Airflow metadata and pipeline data:
+
+```text
+Airflow components ─────── postgres:5432
+                         Airflow metadata only
+
+Airflow worker ────────── warehouse-postgres:5432
+                         Bronze, silver, and gold data
+
+Windows host ─────────── localhost:5433
+                         Published warehouse port
+```
+
+The pipeline must never create bronze, silver, or gold objects in Airflow's metadata database.
+
+Create an Airflow Connection named `binance_warehouse` with the following container-side settings:
+
+| Field | Value |
+| --- | --- |
+| Host | `warehouse-postgres` |
+| Port | `5432` |
+| Database | `warehouse` |
+| User | `postgres` |
+| Password | Supplied through local environment configuration |
+
+Code running inside an Airflow container must use `warehouse-postgres:5432`, not `localhost:5433`. The published `localhost:5433` address is only for tools running directly on the Windows host.
+
+## 6. Binance API contract
 
 Use Binance's public [Kline/Candlestick endpoint](https://developers.binance.com/en/docs/catalog/core-trading-spot-trading/api/rest-api/market#klinecandlestick-data):
 
 ```text
-GET /api/v3/klines
+GET https://data-api.binance.vision/api/v3/klines
 ```
 
-Example request:
-
-```text
-https://data-api.binance.vision/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=10
-```
-
-The market-data-only endpoint does not require an API key. See Binance's [Market Data Only documentation](https://developers.binance.com/en/docs/products/spot/faqs/market_data_only).
-
-Build the request using Python parameters rather than storing one long URL:
+Initial request parameters:
 
 ```python
-import requests
-
-BASE_URL = "https://data-api.binance.vision/api/v3/klines"
-
 params = {
     "symbol": "BTCUSDT",
     "interval": "1m",
     "limit": 10,
 }
-
-response = requests.get(BASE_URL, params=params, timeout=30)
-response.raise_for_status()
-raw_klines = response.json()
 ```
 
-Binance returns each candle as an array rather than an object. Its important positions are:
+The market-data-only endpoint does not require an API key. Use an HTTP timeout and call `raise_for_status()` before reading the response body.
 
-```text
-0  open time
-1  open price
-2  high price
-3  low price
-4  close price
-5  volume
-6  close time
-7  quote asset volume
-8  number of trades
-9  taker buy base asset volume
-10 taker buy quote asset volume
-11 unused field
-```
+Each returned candle is an array with exactly 12 positions:
 
-Preserve the complete response in bronze before converting these positions into named columns.
+| Position | Meaning |
+| --- | --- |
+| 0 | Open time |
+| 1 | Open price |
+| 2 | High price |
+| 3 | Low price |
+| 4 | Close price |
+| 5 | Base asset volume |
+| 6 | Close time |
+| 7 | Quote asset volume |
+| 8 | Number of trades |
+| 9 | Taker buy base asset volume |
+| 10 | Taker buy quote asset volume |
+| 11 | Ignored field |
 
-## Pipeline flow
+Validate the outer response and every candle before loading bronze:
+
+- The response must be a non-empty list.
+- Every candle must be a list with exactly 12 positions.
+- Open and close timestamps must be integers.
+- Price and volume fields must be convertible to decimal values.
+- The response must not contain an API error object.
+
+The complete response must be preserved in bronze before any field is renamed, cast, filtered, or aggregated.
+
+## 7. Data architecture
 
 ```text
 Binance Spot API
-       ↓
-Extract recent candles
-       ↓
-Load raw response into PostgreSQL (bronze)
-       ↓
-Flatten and clean candles with pandas (silver)
-       ↓
-Aggregate candles with SQL (gold)
-       ↓
-Run data-quality checks
+       │
+       ▼
+bronze_binance_api_runs
+Complete JSON response and extraction metadata
+       │
+       ▼
+silver_crypto_klines
+Typed, validated, deduplicated one-minute candles
+       │
+       ▼
+gold_crypto_aggregates
+SQL view containing closed-candle time windows
 ```
 
-## Airflow DAG
+### 7.1 Bronze table
 
-Create one DAG named `binance_crypto_elt`.
+Create `bronze_binance_api_runs` with the following logical schema:
 
-```text
-extract_klines
-      ↓
-load_raw_klines
-      ↓
-transform_klines
-      ↓
-load_silver_klines
-      ↓
-build_aggregations
-      ↓
-check_data_quality
-```
+| Column | Suggested type | Purpose |
+| --- | --- | --- |
+| `extraction_id` | `UUID` | Primary key for the source extraction |
+| `airflow_dag_run_id` | `TEXT` | Airflow DAG run lineage |
+| `task_try_number` | `INTEGER` | Airflow task-attempt lineage |
+| `symbol` | `TEXT` | Requested trading pair |
+| `candle_interval` | `TEXT` | Requested Binance interval |
+| `extracted_at` | `TIMESTAMPTZ` | UTC extraction timestamp |
+| `raw_payload` | `JSONB` | Complete API response |
 
-Schedule it every five minutes:
+Required constraints:
 
-```python
-schedule="*/5 * * * *"
-```
+- `extraction_id` is the primary key.
+- Symbol and interval values are not empty.
+- `raw_payload` is a non-empty JSON array.
+- `task_try_number` is positive.
 
-Also begin with:
+The bronze table is append-only. A new successful API request receives a new `extraction_id`, including a request performed by a later task attempt. Airflow lineage fields make those attempts distinguishable.
 
-```python
-catchup=False
-max_active_runs=1
-```
+### 7.2 Silver table
 
-## Task responsibilities
-
-### 1. `extract_klines`
-
-- Request the ten most recent one-minute candles.
-- Use an HTTP timeout.
-- Fail if the response is unsuccessful.
-- Verify that the result is a non-empty list.
-- Generate a unique `run_id`.
-- Record `extracted_at` in UTC.
-- Save the raw JSON response to a shared or temporary file.
-
-Do not pass the complete response through XCom. Pass only small metadata such as the file path, `run_id`, symbol, and extraction timestamp.
-
-### 2. `load_raw_klines`
-
-- Read the JSON file.
-- Insert one row into `bronze_binance_api_runs`.
-- Store the complete response in a PostgreSQL `JSONB` column.
-- Do not flatten, cast, or aggregate it yet.
-
-Suggested columns:
-
-```text
-run_id
-symbol
-candle_interval
-extracted_at
-raw_payload
-```
-
-Use `run_id` as the primary key.
-
-### 3. `transform_klines`
-
-- Read the raw payload from the bronze table.
-- Convert each Binance array into a named record.
-- Use pandas to create a DataFrame.
-- Convert millisecond timestamps into UTC datetimes.
-- Convert price and volume strings into numeric values.
-- Add the symbol, interval, and source run ID.
-
-This transformation occurs after loading bronze, so the pipeline remains ELT.
-
-### 4. `load_silver_klines`
-
-Load the cleaned DataFrame into `silver_crypto_klines`.
-
-Suggested columns:
+Create `silver_crypto_klines` with the following columns:
 
 ```text
 symbol
@@ -201,32 +210,38 @@ quote_asset_volume
 number_of_trades
 taker_buy_base_asset_volume
 taker_buy_quote_asset_volume
-source_run_id
+is_closed
+source_extraction_id
 loaded_at
 ```
 
-Use this unique key:
+Use the following key:
 
 ```text
-(symbol, candle_interval, open_time)
+PRIMARY KEY (symbol, candle_interval, open_time)
 ```
 
-Because requests overlap, use an upsert instead of a plain insert. A candle returned before it closes may change, so a later run should update the existing row.
+Use `NUMERIC`, not floating-point database types, for prices and volumes. Use `TIMESTAMPTZ` for timestamps and `BIGINT` for the number of trades.
 
-### 5. `build_aggregations`
+`source_extraction_id` must reference the bronze extraction that last inserted or updated the silver row. Compute `is_closed` by comparing the candle's close time with the UTC extraction time. A later overlapping extraction should change it to `TRUE` after the candle closes.
 
-Use SQL to build a `gold_crypto_aggregates` table or view. Choose the aggregation yourself so you can compare how the results change.
+Required database constraints:
 
-Possible windows:
+- `close_time >= open_time`
+- `high_price >= low_price`
+- `high_price >= open_price` and `high_price >= close_price`
+- `low_price <= open_price` and `low_price <= close_price`
+- Prices, volumes, and trade counts are not negative
 
-- Five-minute price summaries
-- Fifteen-minute price summaries
-- Hourly price summaries
+### 7.3 Gold view
 
-Possible output fields:
+Create `gold_crypto_aggregates` as a PostgreSQL view during database setup. The initial view should aggregate only rows where `is_closed = TRUE` and should emit a window only after all five expected one-minute candles are present.
+
+Begin with five-minute windows and expose:
 
 ```text
 symbol
+candle_interval
 window_start
 window_minutes
 open_price
@@ -237,171 +252,278 @@ total_volume
 total_trades
 price_change
 price_change_pct
-created_at
 ```
 
-For each window:
+For every window:
 
-- `open_price` is the first candle's open.
+- `open_price` is the first candle's open when ordered by `open_time`.
 - `high_price` is the maximum high.
 - `low_price` is the minimum low.
-- `close_price` is the last candle's close.
-- `total_volume` is the sum of volume.
+- `close_price` is the last candle's close when ordered by `open_time`.
+- `total_volume` is the sum of base asset volume.
+- `total_trades` is the sum of trade counts.
 - `price_change` is close minus open.
 - `price_change_pct` is `(close - open) / open * 100`.
 
-Start with one aggregation window. Add the others only after it works.
+The SQL must explicitly order the first and last values. It must not rely on insertion order.
 
-### 6. `check_data_quality`
+A view requires no per-run Airflow task because it always reflects the current silver table. A later exercise may replace it with a physical table maintained by an idempotent `build_aggregations` task.
 
-Fail the DAG when an important rule is violated:
+## 8. DAG design
 
-- A bronze row exists for the current run.
-- At least one silver candle exists for the requested period.
-- Required timestamps and prices are not null.
-- `high_price >= low_price`.
-- `high_price` is not lower than open or close.
-- `low_price` is not higher than open or close.
-- Prices and volumes are not negative.
-- `number_of_trades` is not negative.
-- No duplicate silver unique keys exist.
-
-## Suggested project structure
+Create one DAG named `binance_crypto_elt`:
 
 ```text
-binance-elt/
-├── dags/
-│   └── binance_crypto_elt.py
-├── include/
-│   └── binance/
-│       ├── __init__.py
-│       ├── extract.py
-│       ├── transform.py
-│       ├── load.py
-│       └── validate.py
-├── sql/
-│   ├── create_tables.sql
-│   ├── build_aggregations.sql
-│   └── quality_checks.sql
-├── tests/
-│   ├── test_extract.py
-│   ├── test_transform.py
-│   └── fixtures/
-│       └── binance_klines_response.json
-├── data/
-├── docker-compose.yaml
-└── requirements.txt
+extract_and_load_bronze
+          │
+          ▼
+transform_and_load_silver
+          │
+          ▼
+check_data_quality
 ```
 
-Airflow only needs to discover the DAG file under `dags/`. The `include/binance/` structure is an organizational choice for keeping normal Python logic outside the DAG definition.
+Initial DAG configuration:
 
-The files should have these responsibilities:
+```python
+schedule="*/5 * * * *"
+catchup=False
+max_active_runs=1
+```
 
-- `extract.py`: API request logic
-- `transform.py`: pandas transformations
-- `load.py`: PostgreSQL inserts and upserts
-- `validate.py`: API and DataFrame validation
-- `binance_crypto_elt.py`: Airflow tasks, scheduling, dependencies, and retries
+Use a fixed, time-zone-aware UTC `start_date`. Configure task retries with a reasonable delay. The task retry policy should handle temporary network or database failures without creating duplicate silver rows.
 
-Keep the DAG file thin. Extraction and transformation functions should be runnable and testable without starting a complete DAG run.
+### 8.1 `extract_and_load_bronze`
 
-## Testing approach
+Responsibilities:
 
-### Unit tests
+1. Read the symbol, interval, and limit from DAG configuration.
+2. Request Binance klines with a timeout.
+3. Validate the HTTP response and candle structure.
+4. Generate a UUID `extraction_id`.
+5. Record the UTC extraction time, Airflow DAG run ID, and task try number.
+6. Insert the complete response and metadata into bronze in one database transaction.
+7. Return only `extraction_id` through XCom.
 
-- Save one real Binance response as a fixture.
-- Mock the HTTP request in extraction tests.
-- Test an empty API response.
-- Test a malformed candle with missing positions.
-- Test timestamp and numeric conversions.
-- Test the expected DataFrame columns and types.
+The HTTP request and bronze insert belong in one task. This prevents a raw response from being transferred through a worker-local temporary file. The bronze insert completes before any transformation begins, preserving the ELT boundary.
 
-### Database and SQL tests
+### 8.2 `transform_and_load_silver`
 
-- Load a known fixture into a test bronze table.
-- Run the pandas transformation and silver load.
-- Reprocess the same candles and verify that duplicates are not created.
-- Change one candle and confirm that the upsert updates it.
-- Run your aggregation SQL and compare its result with a manually calculated result.
+Responsibilities:
 
-### Airflow tests
+1. Receive `extraction_id` from the upstream task.
+2. Read the matching bronze payload from PostgreSQL.
+3. Convert each 12-position array into a named record.
+4. Convert millisecond timestamps into time-zone-aware UTC datetimes.
+5. Convert prices and volumes without introducing floating-point database values.
+6. Calculate `is_closed` using the extraction timestamp.
+7. Validate the transformed DataFrame.
+8. Upsert the rows into silver in one database transaction.
 
-- Confirm that Airflow parses the DAG without import errors.
-- Run tasks individually while developing them.
-- Trigger the full DAG manually before enabling the schedule.
-- Inspect task logs and PostgreSQL row counts.
-- Let the schedule run several times and confirm that new candles appear.
+Use the silver primary key as the conflict target. On conflict, update candle values, `is_closed`, `source_extraction_id`, and `loaded_at`.
 
-## Implementation milestones
+Do not pass the DataFrame through XCom. XCom should contain only the extraction identifier and other small metadata.
 
-### Milestone 1 — Explore the API
+### 8.3 `check_data_quality`
 
-- Run the request from a normal Python file or notebook.
+Fail the DAG when any required condition is violated:
+
+- The bronze row exists for the current `extraction_id`.
+- Silver contains at least one row in the current extraction's open-time range.
+- Required timestamps and prices are not null.
+- Price-range constraints hold.
+- Prices, volumes, and trade counts are not negative.
+- No duplicate silver primary keys exist.
+- Every silver `source_extraction_id` references bronze.
+- Every complete five-minute window from the current range is visible in gold.
+
+Checks should raise clear exceptions that identify the failed rule and relevant extraction ID.
+
+## 9. Database initialization and migrations
+
+Place first-time schema files under `sql/init/` so PostgreSQL executes them when the warehouse data volume is initially created:
+
+```text
+sql/init/
+├── 001_create_bronze_binance_api_runs.sql
+├── 002_create_silver_crypto_klines.sql
+└── 003_create_gold_crypto_aggregates.sql
+```
+
+PostgreSQL initialization scripts execute only against an empty data directory. Editing an initialization file does not update an existing warehouse volume.
+
+Use the following rule:
+
+- Initial bootstrap: versioned files under `sql/init/`
+- Subsequent schema changes: explicit versioned migrations
+
+Do not depend on deleting the database volume as the normal method for applying schema changes.
+
+## 10. Project structure
+
+```text
+airflow-project/
+├── dags/
+│   └── binance_crypto_elt.py
+├── src/
+│   └── airflow_project/
+│       └── binance/
+│           ├── __init__.py
+│           ├── extract.py
+│           ├── transform.py
+│           ├── load.py
+│           └── validate.py
+├── sql/
+│   └── init/
+│       ├── 001_create_bronze_binance_api_runs.sql
+│       ├── 002_create_silver_crypto_klines.sql
+│       └── 003_create_gold_crypto_aggregates.sql
+├── tests/
+│   ├── fixtures/
+│   │   └── binance_klines_response.json
+│   ├── test_extract.py
+│   ├── test_transform.py
+│   ├── test_load.py
+│   └── test_dag.py
+├── docker-compose.yaml
+├── Dockerfile
+├── pyproject.toml
+└── uv.lock
+```
+
+Keep the DAG file limited to orchestration concerns: configuration, task definitions, dependencies, retry policy, and scheduling. Place reusable extraction, transformation, loading, and validation logic under `src/airflow_project/binance/`.
+
+All non-Airflow functions should be directly importable and testable without starting the scheduler.
+
+## 11. Implementation phases
+
+### Phase 1 — Validate the environment
+
+- Build the custom Airflow image.
+- Initialize and start the Compose environment.
+- Confirm that all required services are healthy.
+- Confirm that the Airflow worker can resolve `warehouse-postgres`.
+- Create and test the `binance_warehouse` Airflow Connection.
+
+### Phase 2 — Explore and validate the API
+
+- Execute the Binance request from a normal Python module or notebook.
 - Inspect the array-based response.
-- Convert timestamps and numeric strings manually.
-- Save one response as a test fixture.
+- Confirm UTC timestamp conversion.
+- Confirm decimal conversion of price and volume fields.
+- Save one representative response as a test fixture.
 
-### Milestone 2 — Set up the database
+### Phase 3 — Create the data model
 
 - Create bronze and silver tables.
-- Insert a sample raw response into bronze.
-- Transform it with pandas and load it into silver.
-- Query the clean candles in chronological order.
+- Create the initial five-minute gold view.
+- Insert a fixture into bronze manually.
+- Transform and upsert it into silver.
+- Query silver chronologically and inspect the gold result.
 
-### Milestone 3 — Build the Airflow DAG
+### Phase 4 — Implement testable Python functions
 
-- Define the tasks and dependencies.
+- Implement API extraction and validation.
+- Implement bronze insertion.
+- Implement payload transformation.
+- Implement silver upsert logic.
+- Implement data-quality functions.
+- Run unit and database integration tests before creating the DAG.
+
+### Phase 5 — Build the DAG
+
+- Define the three tasks and dependencies.
+- Configure the schedule, start date, retries, and task timeouts.
 - Run each task individually.
-- Trigger the complete pipeline manually.
-- Confirm that bronze and silver receive data.
+- Trigger the complete DAG manually.
+- Verify bronze, silver, and gold results.
+- Enable the schedule only after the manual run succeeds.
 
-### Milestone 4 — Make the pipeline reliable
+### Phase 6 — Prove reliability
 
-- Add retries and an HTTP timeout.
-- Add unique keys and upserts.
-- Add data-quality checks.
-- Re-run the same task and confirm that it does not create duplicates.
+- Allow several scheduled runs to overlap at the candle level.
+- Confirm that silver does not accumulate duplicate keys.
+- Confirm that an unfinished candle is updated and later marked closed.
+- Retry and clear tasks to observe retry behavior.
+- Confirm that failures produce useful logs and quality-check messages.
 
-### Milestone 5 — Build your aggregation
+## 12. Testing requirements
 
-- Create one SQL aggregation window.
-- Let the DAG run for enough time to collect data.
-- Compare successive aggregation results.
-- Verify the calculations manually using a small sample.
+### 12.1 Unit tests
 
-### Milestone 6 — Optional improvements
+- Mock the Binance HTTP request.
+- Test a valid response.
+- Test an empty response.
+- Test an API error object.
+- Test a malformed candle with fewer or more than 12 positions.
+- Test timestamp conversion and UTC awareness.
+- Test decimal conversion.
+- Test `is_closed` for open and closed candles.
+- Test expected DataFrame columns and null handling.
+
+### 12.2 Database integration tests
+
+- Insert a known bronze fixture.
+- Transform and load it into silver.
+- Reprocess the same candles and confirm that row counts do not increase.
+- Modify one candle and confirm that the upsert updates it.
+- Confirm that `source_extraction_id` changes to the latest extraction.
+- Confirm that database constraints reject invalid values.
+- Compare one gold window with a manually calculated result.
+- Confirm that unfinished candles and incomplete five-minute windows are excluded from gold.
+
+### 12.3 Airflow tests
+
+- Confirm that Airflow parses the DAG without import errors.
+- Confirm the expected task IDs and dependencies.
+- Run tasks individually during development.
+- Trigger a full manual DAG run.
+- Confirm that XCom stores the extraction identifier rather than the payload or DataFrame.
+- Retry or clear a task and confirm silver idempotency.
+
+## 13. Live polling and historical backfills
+
+The initial DAG is a live polling pipeline. A request containing only `symbol`, `interval`, and `limit` always retrieves the most recent candles. Re-running an older Airflow DAG run therefore does not reproduce the historical data interval associated with that run.
+
+Historical extraction must be implemented separately after the live pipeline is reliable:
+
+- Supply Binance `startTime` and `endTime` parameters.
+- Derive boundaries from Airflow's data interval.
+- Respect the endpoint result limit and paginate until the interval is complete.
+- Reuse the same bronze and silver loading functions.
+- Preserve idempotency through the silver primary key.
+- Prefer a separately triggered backfill DAG or an explicit historical mode rather than silently changing the live DAG's semantics.
+
+Do not describe the initial `limit=10` design as a backfill implementation.
+
+## 14. Optional extensions
+
+Complete the initial project before adding any of the following:
 
 - Add `ETHUSDT` and `BNBUSDT`.
 - Use Airflow dynamic task mapping for multiple symbols.
-- Add more aggregation windows.
-- Create a simple dashboard from the gold table.
-- Backfill older candles using `startTime` and `endTime`.
-- Partition a larger silver table by date.
+- Add fifteen-minute and hourly gold windows.
+- Replace the gold view with an incrementally maintained table.
+- Add a database migration tool.
+- Create a dashboard from the gold layer.
+- Add historical backfill support.
+- Partition a substantially larger silver table by date.
+- Build a separate large historical-data exercise with Spark.
 
-## Definition of done
+WebSockets and streaming platforms are intentionally excluded from this scheduled batch project.
 
-The initial project is complete when:
+## 15. Definition of done
 
-- Airflow requests Binance data every five minutes.
-- Every extraction is preserved in bronze.
-- Silver contains clean and correctly typed candles.
-- Overlapping requests do not create duplicates.
-- An unfinished candle can be updated by a later run.
-- Your gold query correctly aggregates a chosen time window.
-- Invalid data causes the quality-check task to fail clearly.
-- Extraction and transformation logic have automated tests.
+The initial project is complete when all of the following conditions are satisfied:
 
-## Recommended learning order
-
-1. Binance response structure
-2. pandas DataFrame creation and type conversion
-3. DAG structure and task dependencies
-4. Airflow task logs and retries
-5. Airflow Connections
-6. PostgreSQL `JSONB`
-7. Idempotent upserts
-8. SQL time-based aggregation
-9. Data-quality checks
-10. Scheduling and backfills
-
-Avoid WebSockets, streaming platforms, dashboards, and Spark until the scheduled batch pipeline works reliably.
+- Airflow retrieves `BTCUSDT` candles every five minutes.
+- Every successful extraction is preserved in bronze with lineage metadata.
+- Silver contains correctly typed, UTC-normalized candle records.
+- Reprocessing overlapping candles does not create duplicates.
+- An unfinished candle can be updated and later marked closed.
+- The five-minute gold view uses ordered open and close values.
+- Unfinished candles and incomplete five-minute windows are excluded from the initial gold results.
+- Invalid data causes a clear quality-check failure.
+- Extraction, transformation, and loading logic have automated tests.
+- The DAG parses successfully and completes a manual end-to-end run.
+- Several scheduled runs complete without violating database constraints or silver uniqueness.
