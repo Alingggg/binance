@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS silver_crypto_klines (
         PRIMARY KEY (symbol, candle_interval, open_time),
     CONSTRAINT silver_crypto_klines_source_extraction_fk
         FOREIGN KEY (source_extraction_id)
-        REFERENCES bronze_binance_api_runs (extraction_id),
+        REFERENCES bronze_binance_api_runs (extraction_id)
+        ON DELETE CASCADE,
     CONSTRAINT silver_crypto_klines_symbol_chk
         CHECK (btrim(symbol) <> ''),
     CONSTRAINT silver_crypto_klines_interval_chk
