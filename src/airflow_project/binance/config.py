@@ -1,4 +1,15 @@
-DB_URL = "postgresql://postgres:postgres@warehouse-postgres:5432/warehouse"
+import os
+import clickhouse_connect
+
+def get_warehouse_client():
+    return clickhouse_connect.get_client(
+        host=os.getenv("CLICKHOUSE_HOST", "warehouse-clickhouse"),
+        port=int(os.getenv("CLICKHOUSE_PORT", "8123")),
+        database=os.getenv("CLICKHOUSE_DB", "warehouse"),
+        username=os.getenv("CLICKHOUSE_USER", "airflow"),
+        password=os.getenv("CLICKHOUSE_PASSWORD", "airflow"),
+        connect_timeout=10,
+    )
 
 BINANCE_KLINE_URL = "https://data-api.binance.vision/api/v3/klines"
 BINANCE_KLINE_PARAMS = {

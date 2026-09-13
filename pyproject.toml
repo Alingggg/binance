@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.12"
 dependencies = [
+    "clickhouse-connect>=1.8.0",
     "pandas>=3.0.5",
-    "psycopg[binary]>=3.3.4",
     "requests>=2.34.2",
 ]
 
